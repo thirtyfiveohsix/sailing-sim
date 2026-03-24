@@ -16,6 +16,8 @@ type Boat = {
   angularVel: number
   sailTrim: number
   tack: 1 | -1
+  forwardSpeed: number
+  leewaySpeed: number
 }
 
 type RaceState = {
@@ -24,6 +26,17 @@ type RaceState = {
   lapsDone: number
   raceFinished: boolean
   finishTime: number | null
+}
+
+type FeedbackState = 'luffing' | 'pinching' | 'powered' | 'fast reach' | 'running' | 'overtrimmed' | 'undertrimmed'
+
+type Telemetry = {
+  relWindDeg: number
+  targetSpeed: number
+  trimEfficiency: number
+  idealTrim: number
+  vmg: number
+  feedback: FeedbackState
 }
 
 type SimState = {
@@ -35,12 +48,14 @@ type SimState = {
   time: number
   race: RaceState
   splashText: string
+  telemetry: Telemetry
 }
 
 const TAU = Math.PI * 2
 const WORLD_W = 2400
 const WORLD_H = 1800
 const MARK_TOUCH = 52
+const NO_GO_DEG = 38
 
 const app = document.querySelector<HTMLDivElement>('#app')!
 app.innerHTML = `
@@ -48,11 +63,11 @@ app.innerHTML = `
     <div class="topbar">
       <div>
         <div class="title">Sailing Sim</div>
-        <div class="subtitle">Browser-based top-down prototype. Believable wind, simple trim, marks, and tacking that actually matters.</div>
+        <div class="subtitle">Polar-style sailing model rewrite. The goal is clearer points of sail, cleaner trim logic, and boat behavior that makes tactical sense.</div>
       </div>
       <div class="topbar-right">
         <div class="pill" id="status-pill">Ready</div>
-        <div class="pill">V1: one boat, one lap, shifting breeze</div>
+        <div class="pill">V2 feel pass: forward speed + leeway + polar target</div>
       </div>
     </div>
     <div class="main">
@@ -68,13 +83,13 @@ app.innerHTML = `
         </div>
 
         <div class="panel">
-          <div class="panel-title">What this prototype is modeling</div>
+          <div class="panel-title">Model assumptions</div>
           <ul class="legend">
-            <li>No-go zone upwind</li>
-            <li>Trim efficiency depends on apparent wind angle</li>
-            <li>Keel reduces sideways slip but not perfectly</li>
-            <li>Rudder turns better when water is flowing past the hull</li>
-            <li>Wind oscillates slowly, so headers/lifts are a thing</li>
+            <li>Boat speed chases a target based on point of sail</li>
+            <li>Fastest on a beam reach, worse dead downwind, dead in the no-go zone</li>
+            <li>Trim is "in" upwind and "out" downwind</li>
+            <li>Keel kills most but not all sideways slip</li>
+            <li>Rudder turns harder when the boat has flow and costs speed when abused</li>
           </ul>
         </div>
 
@@ -93,8 +108,9 @@ app.innerHTML = `
           <ul class="notes">
             <li>Green ring = next mark.</li>
             <li>Dashed white line = course to next mark.</li>
-            <li>Yellow wedge at bow = no-go zone preview.</li>
-            <li>The goal is feel, not naval architecture purity.</li>
+            <li>Yellow bow wedge = no-go preview.</li>
+            <li>White wake length = actual speed.</li>
+            <li>Try a beam reach first — that should feel best.</li>
           </ul>
           <div class="btn-row" style="margin-top:12px;">
             <button id="reset-btn">Reset race</button>
@@ -106,7 +122,7 @@ app.innerHTML = `
       <div class="viewport-wrap">
         <div class="canvas-shell panel">
           <canvas id="game"></canvas>
-          <div class="overlay" id="overlay"><strong>Reach the green mark.</strong> Trim in on reaches, ease on runs, tack upwind.</div>
+          <div class="overlay" id="overlay"><strong>Beam reach should be fast.</strong> Sheet in upwind, ease on runs, and don’t point too high.</div>
         </div>
       </div>
     </div>
@@ -166,6 +182,11 @@ function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t
 }
 
+function smoothstep01(t: number): number {
+  const x = clamp(t, 0, 1)
+  return x * x * (3 - 2 * x)
+}
+
 function normalizeAngle(a: number): number {
   while (a <= -Math.PI) a += TAU
   while (a > Math.PI) a -= TAU
@@ -174,6 +195,10 @@ function normalizeAngle(a: number): number {
 
 function degrees(rad: number): number {
   return ((rad * 180) / Math.PI + 360) % 360
+}
+
+function radians(deg: number): number {
+  return (deg * Math.PI) / 180
 }
 
 function headingToUi(rad: number): string {
@@ -206,8 +231,10 @@ function createState(seedShift = Math.random() * TAU): SimState {
       vel: vec(0, 0),
       heading: -0.25,
       angularVel: 0,
-      sailTrim: 0.58,
+      sailTrim: 0.34,
       tack: 1,
+      forwardSpeed: 0,
+      leewaySpeed: 0,
     },
     windDir: -1.0,
     windSpeed: 16,
@@ -215,7 +242,15 @@ function createState(seedShift = Math.random() * TAU): SimState {
     tiller: 0,
     time: 0,
     race: makeRace(),
-    splashText: 'Sail the course. Upwind legs should make you work for it.',
+    splashText: 'Sail the course. Beam reaches should feel best. Upwind should require tacking.',
+    telemetry: {
+      relWindDeg: 0,
+      targetSpeed: 0,
+      trimEfficiency: 0,
+      idealTrim: 0,
+      vmg: 0,
+      feedback: 'powered',
+    },
   }
 }
 
@@ -237,66 +272,82 @@ function centerCamera(snap = false): void {
 }
 
 function getWindDir(t: number): number {
-  return state.windDir + Math.sin(t * 0.08 + state.windShiftPhase) * 0.38 + Math.sin(t * 0.023 + state.windShiftPhase * 0.7) * 0.14
+  return state.windDir + Math.sin(t * 0.08 + state.windShiftPhase) * 0.34 + Math.sin(t * 0.023 + state.windShiftPhase * 0.7) * 0.12
+}
+
+function polarSpeedFactor(relWindDeg: number): number {
+  const a = Math.abs(relWindDeg)
+  if (a < NO_GO_DEG) return 0
+  if (a < 55) return lerp(0.42, 0.7, smoothstep01((a - NO_GO_DEG) / (55 - NO_GO_DEG)))
+  if (a < 90) return lerp(0.7, 1.0, smoothstep01((a - 55) / 35))
+  if (a < 135) return lerp(1.0, 0.83, smoothstep01((a - 90) / 45))
+  if (a <= 180) return lerp(0.83, 0.62, smoothstep01((a - 135) / 45))
+  return 0.62
+}
+
+function idealTrimForAngle(relWindDeg: number): number {
+  const a = Math.abs(relWindDeg)
+  return clamp((a - NO_GO_DEG) / (180 - NO_GO_DEG), 0.08, 1)
+}
+
+function describeState(relWindDeg: number, trimError: number): FeedbackState {
+  const a = Math.abs(relWindDeg)
+  if (a < NO_GO_DEG - 2) return 'luffing'
+  if (a < 50) return trimError > 0.18 ? 'pinching' : 'powered'
+  if (a < 105) return trimError > 0.16 ? (state.boat.sailTrim > state.telemetry.idealTrim ? 'overtrimmed' : 'undertrimmed') : 'fast reach'
+  if (a < 150) return trimError > 0.16 ? (state.boat.sailTrim > state.telemetry.idealTrim ? 'overtrimmed' : 'undertrimmed') : 'powered'
+  return trimError > 0.16 ? (state.boat.sailTrim > state.telemetry.idealTrim ? 'overtrimmed' : 'undertrimmed') : 'running'
 }
 
 function update(dt: number): void {
   state.time += dt
 
-  if (keys.has('ArrowLeft')) state.tiller -= dt * 2.2
-  if (keys.has('ArrowRight')) state.tiller += dt * 2.2
+  if (keys.has('ArrowLeft')) state.tiller -= dt * 2.5
+  if (keys.has('ArrowRight')) state.tiller += dt * 2.5
   if (!keys.has('ArrowLeft') && !keys.has('ArrowRight')) state.tiller *= Math.pow(0.0001, dt)
   state.tiller = clamp(state.tiller, -1, 1)
 
-  if (keys.has('ArrowUp')) state.boat.sailTrim += dt * 0.6
-  if (keys.has('ArrowDown')) state.boat.sailTrim -= dt * 0.6
+  if (keys.has('ArrowUp')) state.boat.sailTrim -= dt * 0.7
+  if (keys.has('ArrowDown')) state.boat.sailTrim += dt * 0.7
   state.boat.sailTrim = clamp(state.boat.sailTrim, 0.05, 1)
 
   const boat = state.boat
-  const headingVec = fromAngle(boat.heading)
-  const portVec = fromAngle(boat.heading - Math.PI / 2)
-  const starboardVec = fromAngle(boat.heading + Math.PI / 2)
   const windDir = getWindDir(state.time)
-  const trueWind = mul(fromAngle(windDir), state.windSpeed)
-  const apparent = sub(trueWind, boat.vel)
-  const appSpeed = len(apparent)
-  const appDir = Math.atan2(apparent.y, apparent.x)
-  const relWind = normalizeAngle(appDir - boat.heading)
-  boat.tack = relWind >= 0 ? 1 : -1
 
-  const absRel = Math.abs(relWind)
-  const noGo = 0.7
-  const driveWindow = clamp((absRel - noGo) / (Math.PI - noGo), 0, 1)
-  const idealTrim = clamp((absRel - 0.35) / (Math.PI - 0.35), 0.08, 1)
+  const trueWindFrom = normalizeAngle(windDir + Math.PI)
+  const relWindDeg = Math.abs((normalizeAngle(trueWindFrom - boat.heading) * 180) / Math.PI)
+  boat.tack = normalizeAngle(trueWindFrom - boat.heading) >= 0 ? 1 : -1
+
+  const idealTrim = idealTrimForAngle(relWindDeg)
   const trimError = Math.abs(boat.sailTrim - idealTrim)
-  const trimEfficiency = Math.max(0, 1 - trimError * 1.8)
-  const sailDrive = driveWindow * trimEfficiency
+  const trimEfficiency = clamp(1 - trimError * 1.9, 0, 1)
+  const polarFactor = polarSpeedFactor(relWindDeg)
+  const targetSpeed = state.windSpeed * 0.42 * polarFactor * (0.35 + 0.65 * trimEfficiency)
 
-  const forwardForce = headingVec
-  const sideSign = relWind >= 0 ? -1 : 1
-  const sideForceDir = sideSign > 0 ? starboardVec : portVec
+  const accelRate = relWindDeg < NO_GO_DEG ? 0.6 : 1.8 + polarFactor * 1.5
+  const baseDecel = relWindDeg < NO_GO_DEG ? 2.4 : 0.95
+  boat.forwardSpeed += (targetSpeed - boat.forwardSpeed) * accelRate * dt
+  boat.forwardSpeed -= Math.abs(state.tiller) * Math.max(0, boat.forwardSpeed - 1.5) * 0.45 * dt
+  boat.forwardSpeed -= boat.forwardSpeed * baseDecel * 0.08 * dt
+  boat.forwardSpeed = clamp(boat.forwardSpeed, 0, state.windSpeed * 0.52)
 
-  const sailForceMag = appSpeed * appSpeed * 0.018 * sailDrive
-  const sideForceMag = appSpeed * appSpeed * 0.010 * sailDrive * (1.15 - Math.abs(Math.cos(relWind)))
+  const sidewaysPressure = state.windSpeed * Math.sin(radians(relWindDeg))
+  const desiredLeeway = boat.tack * sidewaysPressure * (0.12 + (1 - trimEfficiency) * 0.12 + Math.max(0, 0.55 - polarFactor) * 0.18)
+  const keelGrip = 4.5 + polarFactor * 2.5 + boat.forwardSpeed * 0.3
+  boat.leewaySpeed += (desiredLeeway - boat.leewaySpeed) * dt * 1.8
+  boat.leewaySpeed -= boat.leewaySpeed * keelGrip * 0.13 * dt
 
-  const velocityForward = dot(boat.vel, headingVec)
-  const velocitySide = dot(boat.vel, starboardVec)
-
-  const keelGrip = clamp(0.35 + Math.abs(Math.sin(relWind)) * 0.85, 0.35, 1.05)
-  const lateralDrag = mul(starboardVec, -velocitySide * (2.8 + keelGrip * 2.5))
-  const hullDrag = mul(boat.vel, -(0.22 + len(boat.vel) * 0.018))
-  const rudderTurn = state.tiller * clamp(Math.abs(velocityForward) / 8, 0, 1) * 2.2
-  const weatherHelm = sideForceMag * (boat.tack === 1 ? 1 : -1) * 0.006
-
-  const force = add(
-    add(mul(forwardForce, sailForceMag), mul(sideForceDir, sideForceMag)),
-    add(lateralDrag, hullDrag),
-  )
-
-  boat.vel = add(boat.vel, mul(force, dt))
-  boat.pos = add(boat.pos, mul(boat.vel, dt * 22))
-  boat.angularVel += (rudderTurn + weatherHelm - boat.angularVel * 1.9) * dt
+  const turnAuthority = clamp(boat.forwardSpeed / 4.8, 0, 1)
+  const weatherHelm = boat.leewaySpeed * 0.018
+  const desiredTurnRate = state.tiller * (0.7 + turnAuthority * 1.9) - weatherHelm
+  boat.angularVel += (desiredTurnRate - boat.angularVel) * dt * (2.2 + turnAuthority * 2.4)
+  boat.angularVel *= 1 - dt * 1.1
   boat.heading = normalizeAngle(boat.heading + boat.angularVel * dt)
+
+  const forwardVec = fromAngle(boat.heading)
+  const sideVec = fromAngle(boat.heading + Math.PI / 2)
+  boat.vel = add(mul(forwardVec, boat.forwardSpeed), mul(sideVec, boat.leewaySpeed))
+  boat.pos = add(boat.pos, mul(boat.vel, dt * 20))
 
   boat.pos.x = clamp(boat.pos.x, 40, WORLD_W - 40)
   boat.pos.y = clamp(boat.pos.y, 40, WORLD_H - 40)
@@ -310,35 +361,48 @@ function update(dt: number): void {
       if (race.nextMark >= race.marks.length) {
         race.raceFinished = true
         race.finishTime = state.time
-        state.splashText = `Finished in ${state.time.toFixed(1)}s. Not bad.`
+        state.splashText = `Finished in ${state.time.toFixed(1)}s. Much more coherent now.`
       }
     }
   }
 
-  centerCamera()
-  updateHud(relWind, windDir)
-}
-
-function updateHud(relWind: number, windDir: number): void {
-  const boat = state.boat
-  const mark = state.race.marks[Math.min(state.race.nextMark, state.race.marks.length - 1)]
+  const mark = race.marks[Math.min(race.nextMark, race.marks.length - 1)]
   const toMark = normalize(sub(mark, boat.pos))
   const vmg = dot(boat.vel, toMark)
-  kpiSpeed.textContent = `${(len(boat.vel) * 1.45).toFixed(1)} kt`
+
+  state.telemetry = {
+    relWindDeg,
+    targetSpeed,
+    trimEfficiency,
+    idealTrim,
+    vmg,
+    feedback: describeState(relWindDeg, trimError),
+  }
+
+  centerCamera()
+  updateHud(windDir)
+}
+
+function updateHud(windDir: number): void {
+  const boat = state.boat
+  const telemetry = state.telemetry
+  kpiSpeed.textContent = `${(boat.forwardSpeed * 1.45).toFixed(1)} kt`
   kpiHeading.textContent = headingToUi(boat.heading)
   kpiWind.textContent = `${headingToUi(windDir)} / ${state.windSpeed.toFixed(0)} kt`
-  kpiVmg.textContent = `${(vmg * 1.45).toFixed(1)} kt`
+  kpiVmg.textContent = `${(telemetry.vmg * 1.45).toFixed(1)} kt`
 
-  const absRelDeg = Math.round(Math.abs((relWind * 180) / Math.PI))
-  statusPill.textContent = state.race.raceFinished
-    ? 'Finished'
-    : absRelDeg < 45
-      ? 'Pinching / no-go risk'
-      : absRelDeg < 110
-        ? 'Powered up'
-        : 'Running deep'
+  const labels: Record<FeedbackState, string> = {
+    luffing: 'Luffing / in irons',
+    pinching: 'Pinching',
+    powered: 'Powered up',
+    'fast reach': 'Fast reach',
+    running: 'Running deep',
+    overtrimmed: 'Overtrimmed',
+    undertrimmed: 'Undertrimmed',
+  }
+  statusPill.textContent = state.race.raceFinished ? 'Finished' : labels[telemetry.feedback]
 
-  overlay.innerHTML = `<strong>${state.splashText}</strong> Next mark: ${state.race.raceFinished ? 'complete' : state.race.nextMark + 1 + ' / ' + state.race.marks.length}. Sail trim ${(boat.sailTrim * 100).toFixed(0)}%.`
+  overlay.innerHTML = `<strong>${state.splashText}</strong> Next mark: ${state.race.raceFinished ? 'complete' : state.race.nextMark + 1 + ' / ' + state.race.marks.length}. Trim ${(boat.sailTrim * 100).toFixed(0)}% · ideal ${(telemetry.idealTrim * 100).toFixed(0)}% · angle ${Math.round(telemetry.relWindDeg)}°.`
 }
 
 function resize(): void {
@@ -441,15 +505,27 @@ function drawCourse(): void {
 
 function drawBoat(windDir: number): void {
   const boat = state.boat
+  const telemetry = state.telemetry
   const p = worldToScreen(boat.pos)
+  const wakeLength = clamp(boat.forwardSpeed * 10, 10, 84)
+
   ctx.save()
   ctx.translate(p.x, p.y)
   ctx.rotate(boat.heading)
 
-  ctx.fillStyle = 'rgba(255, 212, 77, 0.12)'
+  ctx.strokeStyle = 'rgba(230,245,255,0.5)'
+  ctx.lineWidth = 2
+  ctx.beginPath()
+  ctx.moveTo(-22, -6)
+  ctx.lineTo(-22 - wakeLength, -10)
+  ctx.moveTo(-22, 6)
+  ctx.lineTo(-22 - wakeLength, 10)
+  ctx.stroke()
+
+  ctx.fillStyle = 'rgba(255, 212, 77, 0.14)'
   ctx.beginPath()
   ctx.moveTo(0, 0)
-  ctx.arc(0, 0, 86, -0.7, 0.7)
+  ctx.arc(0, 0, 88, radians(-NO_GO_DEG), radians(NO_GO_DEG))
   ctx.closePath()
   ctx.fill()
 
@@ -465,11 +541,20 @@ function drawBoat(windDir: number): void {
   ctx.fill()
   ctx.stroke()
 
-  ctx.strokeStyle = '#9bd4ff'
-  ctx.lineWidth = 3
+  const trimColor = telemetry.feedback === 'overtrimmed'
+    ? '#ff8a7a'
+    : telemetry.feedback === 'undertrimmed'
+      ? '#ffd86a'
+      : telemetry.feedback === 'luffing'
+        ? '#cfd8e3'
+        : '#9bd4ff'
+
+  const boomAngle = boat.tack * lerp(0.2, 1.2, boat.sailTrim)
+  ctx.strokeStyle = trimColor
+  ctx.lineWidth = 4
   ctx.beginPath()
-  ctx.moveTo(-8, 0)
-  ctx.lineTo(-8 - 26 * boat.sailTrim, 32 * boat.tack)
+  ctx.moveTo(-6, 0)
+  ctx.lineTo(-6 - Math.cos(boomAngle) * 32, Math.sin(boomAngle) * 32)
   ctx.stroke()
 
   ctx.strokeStyle = '#7ce3ff'
@@ -481,12 +566,12 @@ function drawBoat(windDir: number): void {
 
   ctx.restore()
 
-  const w = worldToScreen(add(boat.pos, mul(fromAngle(windDir), 120)))
+  const windTo = worldToScreen(add(boat.pos, mul(fromAngle(windDir), 120)))
   ctx.strokeStyle = '#d7f0ff'
   ctx.lineWidth = 2
   ctx.beginPath()
   ctx.moveTo(p.x, p.y)
-  ctx.lineTo(w.x, w.y)
+  ctx.lineTo(windTo.x, windTo.y)
   ctx.stroke()
 }
 
