@@ -2,6 +2,10 @@
 
 A browser-based top-down sailing simulation prototype.
 
+## Live demo
+
+GitHub Pages: https://thirtyfiveohsix.github.io/sailing-sim/
+
 ## What it is
 
 A small TypeScript + Canvas game prototype with:
@@ -34,3 +38,7 @@ Then open the local Vite URL in your browser.
 ```bash
 npm run build
 ```
+
+## Deploy
+
+The repo includes a GitHub Actions workflow that builds and deploys to GitHub Pages on every push to `main`.
